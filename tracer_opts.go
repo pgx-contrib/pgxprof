@@ -7,87 +7,66 @@ import (
 	"strings"
 )
 
-// QueryOptions represents the options that can be specified in a SQL query.
+// QueryOptions controls the EXPLAIN command applied to a profiled query.
 type QueryOptions struct {
-	// Explain is a boolean that specifies whether to explain the query.
+	// Explain wraps the query in EXPLAIN. When false, the query is not profiled.
 	Explain bool
-	// Analyze is a boolean that specifies whether to analyze the query.
+	// Analyze adds the ANALYZE clause, which executes the query to collect
+	// runtime statistics. ANALYZE is ignored when Explain is false.
 	Analyze bool
 }
 
-// String returns the string representation of the query options.
+// String returns the EXPLAIN prefix for the given options, or "" when
+// Explain is false.
 func (x *QueryOptions) String() string {
-	var command []string
-	var options []string
-
-	if x.Explain {
-		command = append(command, "EXPLAIN")
+	if x == nil || !x.Explain {
+		return ""
 	}
 
-	// prepare the analyze statement
+	opts := make([]string, 0, 2)
 	if x.Analyze {
-		options = append(options, "ANALYZE")
+		opts = append(opts, "ANALYZE")
 	}
+	opts = append(opts, "FORMAT JSON")
 
-	options = append(options, "FORMAT JSON")
-	command = append(command, "("+strings.Join(options, ", ")+")")
-
-	return strings.Join(command, " ")
+	return "EXPLAIN (" + strings.Join(opts, ", ") + ")"
 }
 
-var patterns = []*regexp.Regexp{
-	regexp.MustCompile(`(@explain) (\d+)`),
-	regexp.MustCompile(`(@analyze) (\d+[s|m|h|d])`),
-}
+var (
+	explainPattern = regexp.MustCompile(`@explain\s+(\S+)`)
+	analyzePattern = regexp.MustCompile(`@analyze\s+(\S+)`)
+)
 
-// ParseQueryOptions parses query options from a SQL query.
+// ParseQueryOptions extracts `@explain`/`@analyze` directives from the query
+// text (typically in a leading SQL comment). It returns (nil, nil) when no
+// directives are present, and an error only when a directive has a malformed
+// value.
 func ParseQueryOptions(query string) (*QueryOptions, error) {
-	var matches [][]string
-	// prepare the matches
-	for _, pattern := range patterns {
-		// find the options
-		item := pattern.FindAllStringSubmatch(query, 2)
-		// if the item is empty
-		if len(item) == 0 {
-			return nil, fmt.Errorf("invalid query cache options")
+	var opts *QueryOptions
+
+	if m := explainPattern.FindStringSubmatch(query); m != nil {
+		v, err := strconv.ParseBool(m[1])
+		if err != nil {
+			return nil, fmt.Errorf("invalid @explain value %q: %w", m[1], err)
 		}
-		// append the item to the matches
-		matches = append(matches, item...)
+		opts = &QueryOptions{Explain: v}
 	}
 
-	options := &QueryOptions{}
-	// iterate over the matches and set the options
-	for _, item := range matches {
-		// if the length of the item is not equal to 2, print MATCH and
-		if len(item) < 3 {
-			return nil, fmt.Errorf("invalid query cache options")
+	if m := analyzePattern.FindStringSubmatch(query); m != nil {
+		v, err := strconv.ParseBool(m[1])
+		if err != nil {
+			return nil, fmt.Errorf("invalid @analyze value %q: %w", m[1], err)
 		}
-		// set the options fields
-		switch item[1] {
-		case "@explain":
-			value, err := strconv.ParseBool(item[2])
-			switch {
-			case err != nil:
-				return nil, fmt.Errorf("invalid @explain query option: %w", err)
-			default:
-				options.Explain = value
-			}
-		case "@analyze":
-			value, err := strconv.ParseBool(item[2])
-			switch {
-			case err != nil:
-				return nil, fmt.Errorf("invalid @analyze query option: %w", err)
-			default:
-				options.Analyze = value
-			}
-
+		if opts == nil {
+			opts = &QueryOptions{}
 		}
+		opts.Analyze = v
 	}
 
-	return options, nil
+	return opts, nil
 }
 
-// QueryPlan is the query plan.
+// QueryPlan is a node in the PostgreSQL EXPLAIN output tree.
 type QueryPlan struct {
 	Alias             string       `json:"Alias"`
 	RelationName      string       `json:"Relation Name"`
@@ -105,7 +84,8 @@ type QueryPlan struct {
 	ParallelAware     bool         `json:"Parallel Aware"`
 }
 
-// QueryTrace is the query anlysis.
+// QueryTrace is a single EXPLAIN result for a query. PostgreSQL returns an
+// array of these; most queries produce one entry.
 type QueryTrace struct {
 	Plan          *QueryPlan `json:"Plan"`
 	PlanningTime  float64    `json:"Planning Time"`

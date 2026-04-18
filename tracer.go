@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -17,248 +16,220 @@ var (
 	_ pgx.BatchTracer = (*QueryTracer)(nil)
 )
 
-// QueryTracer represent a composite query tracer
+// QueryTracer profiles pgx queries by wrapping them in
+// EXPLAIN (ANALYZE, FORMAT JSON) and reporting the decoded plan.
+//
+// Profiling runs synchronously before the real query executes, roughly
+// doubling per-query latency. QueryTracer is intended for development and
+// debugging, not production hot paths.
 type QueryTracer struct {
-	// Querier is the pgx.Querier interface
+	// Options is the default set of EXPLAIN options applied to every
+	// profilable statement. Per-query directives such as
+	//
+	//	-- @explain true
+	//	-- @analyze true
+	//
+	// override these defaults for the statement in which they appear.
+	// When Options is nil and no directives are present, the statement
+	// is not profiled.
 	Options *QueryOptions
+	// Reporter receives the captured traces. When nil, a WriterReporter
+	// that writes JSON to os.Stdout is used.
+	Reporter Reporter
 }
 
 // TraceQueryStart implements pgx.QueryTracer.
-func (q *QueryTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, query pgx.TraceQueryStartData) context.Context {
-	// trace the query
-	trace, err := q.TraceQuery(ctx, conn, query)
-	if err != nil {
+func (q *QueryTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	trace, err := q.traceQuery(ctx, conn, data)
+	if err != nil || trace == nil {
 		return ctx
 	}
-
-	// TODO: handle the trace
-	if trace != nil {
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		encoder.Encode(trace)
-	}
-
+	q.reporter().Report(ctx, trace)
 	return ctx
-}
-
-// TraceQuery traces the query.
-func (x *QueryTracer) TraceQuery(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) (*TraceQueryData, error) {
-	// parse the query options
-	options := x.options(data.SQL)
-	// if the options is nil, return the QueryReport
-	if options == nil {
-		return nil, nil
-	}
-
-	// prepare the statement
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	// prepare the query
-	query := options.String() + " " + data.SQL
-	// analyze the query
-	row := tx.QueryRow(ctx, query, data.Args...)
-
-	output := []byte{}
-	// scan the row
-	if err := row.Scan(&output); err != nil {
-		return nil, err
-	}
-
-	trace := &TraceQueryData{
-		Query: data.SQL,
-		Args:  data.Args,
-	}
-	// unmarshal the data
-	if err := json.Unmarshal(output, &trace); err != nil {
-		return nil, err
-	}
-
-	return trace, nil
 }
 
 // TraceQueryEnd implements pgx.QueryTracer.
 func (q *QueryTracer) TraceQueryEnd(_ context.Context, _ *pgx.Conn, _ pgx.TraceQueryEndData) {
-	// no-op
 }
 
 // TraceBatchStart implements pgx.BatchTracer.
-func (q *QueryTracer) TraceBatchStart(ctx context.Context, conn *pgx.Conn, batch pgx.TraceBatchStartData) context.Context {
-	// trace the query
-	trace, err := q.TraceBatch(ctx, conn, batch)
-	if err != nil {
+func (q *QueryTracer) TraceBatchStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceBatchStartData) context.Context {
+	trace, err := q.traceBatch(ctx, conn, data)
+	if err != nil || trace == nil {
 		return ctx
 	}
-
-	// TODO: handle the trace
-	if trace != nil {
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		encoder.Encode(trace)
-	}
-
+	q.reporter().ReportBatch(ctx, trace)
 	return ctx
 }
 
-// TraceBatch traces the query.
-func (x *QueryTracer) TraceBatch(ctx context.Context, conn *pgx.Conn, data pgx.TraceBatchStartData) (*TraceBatchData, error) {
-	batch := &pgx.Batch{}
-	batchOptions := []*QueryOptions{}
+// TraceBatchQuery implements pgx.BatchTracer.
+func (q *QueryTracer) TraceBatchQuery(_ context.Context, _ *pgx.Conn, _ pgx.TraceBatchQueryData) {
+}
 
-	for _, item := range data.Batch.QueuedQueries {
-		// parse the query options
-		options := x.options(item.SQL)
-		// if the options is nil, return the QueryReport
-		if options == nil {
-			continue
-		}
-		batchOptions = append(batchOptions, options)
-		// prepare the query
-		query := options.String() + " " + item.SQL
-		// append the query to the batch
-		batch.Queue(query, item.Arguments...)
+// TraceBatchEnd implements pgx.BatchTracer.
+func (q *QueryTracer) TraceBatchEnd(_ context.Context, _ *pgx.Conn, _ pgx.TraceBatchEndData) {
+}
+
+func (q *QueryTracer) reporter() Reporter {
+	if q.Reporter != nil {
+		return q.Reporter
 	}
+	return &WriterReporter{}
+}
 
-	if batch.Len() == 0 {
+func (q *QueryTracer) traceQuery(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) (*TraceQueryData, error) {
+	opts := q.resolveOptions(data.SQL)
+	if opts == nil || !opts.Explain {
 		return nil, nil
 	}
 
-	// prepare the statement
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
-	stack := &TraceBatchData{}
-	// prepare the batch
-	for _, item := range batch.QueuedQueries {
-		rows, err := tx.Query(ctx, item.SQL, item.Arguments...)
+	explained := opts.String() + " " + data.SQL
+
+	var raw []byte
+	if err := tx.QueryRow(ctx, explained, data.Args...).Scan(&raw); err != nil {
+		return nil, err
+	}
+
+	traces, err := decodeTraces(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	return &TraceQueryData{
+		Query:  data.SQL,
+		Args:   data.Args,
+		Traces: traces,
+	}, nil
+}
+
+type batchItem struct {
+	explained string
+	origSQL   string
+	args      []any
+}
+
+func (q *QueryTracer) traceBatch(ctx context.Context, conn *pgx.Conn, data pgx.TraceBatchStartData) (*TraceBatchData, error) {
+	var items []batchItem
+	for _, queued := range data.Batch.QueuedQueries {
+		opts := q.resolveOptions(queued.SQL)
+		if opts == nil || !opts.Explain {
+			continue
+		}
+		items = append(items, batchItem{
+			explained: opts.String() + " " + queued.SQL,
+			origSQL:   queued.SQL,
+			args:      queued.Arguments,
+		})
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	out := &TraceBatchData{Queries: make([]*TraceQueryData, 0, len(items))}
+	for _, item := range items {
+		var raw []byte
+		if err := tx.QueryRow(ctx, item.explained, item.args...).Scan(&raw); err != nil {
+			return nil, err
+		}
+		traces, err := decodeTraces(raw)
 		if err != nil {
 			return nil, err
 		}
-		defer rows.Close()
+		out.Queries = append(out.Queries, &TraceQueryData{
+			Query:  item.origSQL,
+			Args:   item.args,
+			Traces: traces,
+		})
+	}
+	return out, nil
+}
 
-		index := 0
-		// iterate the rows
-		for rows.Next() {
-			if err := rows.Err(); err != nil {
-				return nil, err
-			}
+// resolveOptions returns the effective QueryOptions for a statement.
+// Inline directives override the tracer defaults. A statement that is not
+// profilable (DDL, empty, etc.) returns nil.
+func (q *QueryTracer) resolveOptions(sql string) *QueryOptions {
+	if !isProfilable(sql) {
+		return nil
+	}
+	parsed, err := ParseQueryOptions(sql)
+	if err != nil {
+		return nil
+	}
+	if parsed != nil {
+		return parsed
+	}
+	return q.Options
+}
 
-			output := []byte{}
-			// scan the row
-			if err := rows.Scan(&output); err != nil {
-				return nil, err
-			}
+var profilablePrefixes = []string{
+	"SELECT",
+	"INSERT",
+	"UPDATE",
+	"DELETE",
+	"MERGE",
+	"VALUES",
+	"EXECUTE",
+	"DECLARE",
+	"CREATE TABLE AS",
+	"CREATE MATERIALIZED VIEW",
+}
 
-			trace := &TraceQueryData{
-				Query: batch.QueuedQueries[index].SQL,
-				Args:  batch.QueuedQueries[index].Arguments,
-			}
-			// prepare the trace query
-			trace.Query = strings.TrimPrefix(trace.Query, batchOptions[index].String())
-			trace.Query = strings.TrimPrefix(trace.Query, " ")
-			// unmarshal the data
-			if err := json.Unmarshal(output, &trace); err != nil {
-				return nil, err
-			}
-
-			stack.Queries = append(stack.Queries, trace)
+func isProfilable(query string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(stripComments(query)))
+	for _, prefix := range profilablePrefixes {
+		if strings.HasPrefix(normalized, prefix) {
+			return true
 		}
 	}
-
-	return stack, nil
+	return false
 }
 
-// TraceBatchQuery implements pgx.BatchTracer.
-func (q *QueryTracer) TraceBatchQuery(_ context.Context, _ *pgx.Conn, _ pgx.TraceBatchQueryData) {
-	// no-op
-}
-
-// TraceBatchEnd implements pgx.BatchTracer.
-func (q *QueryTracer) TraceBatchEnd(_ context.Context, _ *pgx.Conn, _ pgx.TraceBatchEndData) {
-	// no-op
-}
-
-func (x *QueryTracer) prepare(query string) string {
-	buffer := &bytes.Buffer{}
-	// prepare the scanner
-	scanner := bufio.NewScanner(bytes.NewBufferString(query))
-
+func stripComments(query string) string {
+	var buf bytes.Buffer
+	scanner := bufio.NewScanner(strings.NewReader(query))
 	for scanner.Scan() {
-		text := scanner.Text()
-		// if the text is not a comment, append the text
-		if prefix := strings.TrimSpace(text); !strings.HasPrefix(prefix, "--") {
-			fmt.Fprintln(buffer, text)
+		line := scanner.Text()
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
 		}
+		fmt.Fprintln(&buf, line)
 	}
-
-	query = buffer.String()
-	query = strings.ToUpper(query)
-	query = strings.TrimSpace(query)
-
-	return query
+	return buf.String()
 }
 
-func (x *QueryTracer) options(query string) *QueryOptions {
-	prefix := []string{
-		"SELECT",
-		"INSERT",
-		"UPDATE",
-		"DELETE",
-		"MERGE",
-		"VALUES",
-		"EXECUTE",
-		"DECLARE",
-		"CREATE TABLE AS",
-		"CREATE MATERIALIZED VIEW",
+func decodeTraces(raw []byte) ([]*QueryTrace, error) {
+	var traces []*QueryTrace
+	if err := json.Unmarshal(raw, &traces); err != nil {
+		return nil, err
 	}
-
-	operation := x.prepare(query)
-	// check the operation
-	for _, name := range prefix {
-		// if the query is the operation, return
-		if strings.HasPrefix(operation, name) {
-			// parse the query options
-			options, err := ParseQueryOptions(query)
-			if err != nil {
-				// we should not cache the item
-				return x.Options
-			}
-
-			if !options.Explain {
-				return nil
-			}
-
-			return options
-		}
-	}
-
-	return nil
+	return traces, nil
 }
 
-// TraceBatchData is the query explain.
+// TraceBatchData contains the profiling output for a pgx batch.
 type TraceBatchData struct {
-	// Queries is the query analyzes.
-	Queries []*TraceQueryData `Queries:"Queries"`
+	// Queries is the per-statement trace data.
+	Queries []*TraceQueryData `json:"Queries"`
 }
 
-// TraceQueryData is the query explain.
+// TraceQueryData contains the profiling output for a single query.
 type TraceQueryData struct {
-	// Query is the query
+	// Query is the original SQL as submitted by the caller, without the
+	// EXPLAIN prefix.
 	Query string `json:"Query"`
-	// Args is the query arguments
+	// Args is the argument list bound to the query.
 	Args []any `json:"Args"`
-	// Traces is the query analyzes.
+	// Traces is the decoded EXPLAIN output.
 	Traces []*QueryTrace `json:"Traces"`
-}
-
-// UnmarshalJSON implements the json.Unmarshaler interface.
-func (x *TraceQueryData) UnmarshalJSON(data []byte) error {
-	x.Traces = []*QueryTrace{}
-	return json.Unmarshal(data, &x.Traces)
 }
